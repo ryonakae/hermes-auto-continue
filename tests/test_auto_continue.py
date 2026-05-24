@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+import types
+
+import pytest
+
+from hermes_auto_continue import AutoContinuePlugin, MAX_ITERATION_SUMMARY_REQUEST
+
+
+class FakeSessionEntry:
+    def __init__(self, session_id: str = "session-1", session_key: str = "slack:chat:thread"):
+        self.session_id = session_id
+        self.session_key = session_key
+
+
+class FakeSessionStore:
+    def __init__(self, entry: FakeSessionEntry | None = None):
+        self.entry = entry or FakeSessionEntry()
+
+    def get_or_create_session(self, source):
+        return self.entry
+
+
+class FakeGateway:
+    def __init__(self):
+        self.adapters = {"slack": object()}
+        self.enqueued = []
+
+    def _enqueue_fifo(self, session_key, event, adapter):
+        self.enqueued.append((session_key, event, adapter))
+
+
+def make_event(text: str = "hello", platform: str = "slack"):
+    source = types.SimpleNamespace(
+        platform=platform,
+        chat_id="C123",
+        thread_id="177",
+        user_id="U123",
+        user_name="Ryo",
+    )
+    return types.SimpleNamespace(text=text, source=source, message_id="m1")
+
+
+def max_iteration_history(summary: str = "I reached the limit; here is progress so far."):
+    return [
+        {"role": "user", "content": "do a long task"},
+        {"role": "tool", "content": "tool result"},
+        {"role": "user", "content": MAX_ITERATION_SUMMARY_REQUEST},
+        {"role": "assistant", "content": summary},
+    ]
+
+
+def test_records_gateway_context_and_enqueues_continuation_after_max_iteration_summary():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore()
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert len(gateway.enqueued) == 1
+    session_key, queued_event, adapter = gateway.enqueued[0]
+    assert session_key == "slack:chat:thread"
+    assert adapter is gateway.adapters["slack"]
+    assert queued_event.text == "Proceed."
+    assert queued_event.source is event.source
+    assert queued_event.message_id is None
+    assert queued_event.channel_prompt is None
+
+
+def test_enforces_per_session_auto_continue_bound():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 1, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore()
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    for _ in range(2):
+        plugin.post_llm_call(
+            session_id="session-1",
+            conversation_history=max_iteration_history(),
+            assistant_response="summary",
+            platform="slack",
+        )
+
+    assert len(gateway.enqueued) == 1
+
+
+def test_does_not_enqueue_for_non_max_iteration_turn_and_resets_count_after_normal_turn():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 1, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore()
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=[{"role": "user", "content": "normal"}, {"role": "assistant", "content": "done"}],
+        assistant_response="done",
+        platform="slack",
+    )
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert len(gateway.enqueued) == 2
+
+
+def test_skips_disabled_platform_and_active_goal(monkeypatch):
+    plugin = AutoContinuePlugin(
+        {
+            "enabled": True,
+            "max_auto_continues": 2,
+            "prompt": "Proceed.",
+            "platforms": {"slack": {"enabled": False}},
+        }
+    )
+    gateway = FakeGateway()
+    store = FakeSessionStore()
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+    assert gateway.enqueued == []
+
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    monkeypatch.setattr(plugin, "_active_goal_exists", lambda session_id: True)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+    assert gateway.enqueued == []
+
+
+def test_command_status_and_reset():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore()
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert "session-1" in plugin.command("status")
+    assert "1/2" in plugin.command("status")
+    assert "Reset" in plugin.command("reset")
+    assert "No auto-continue sessions" in plugin.command("status")

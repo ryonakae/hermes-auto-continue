@@ -1,0 +1,9 @@
+name: hermes-auto-continue
+version: 0.1.0
+description: Gateway-only auto-continue after Hermes max-iteration summaries.
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch
+  - post_llm_call
+provides_commands:
+  - auto-continue
