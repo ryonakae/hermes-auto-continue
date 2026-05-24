@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 import logging
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -34,23 +37,21 @@ class AutoContinuePlugin:
         self.enabled = bool(cfg.get("enabled", True))
         self.max_auto_continues = max(0, int(cfg.get("max_auto_continues", 3) or 0))
         self.prompt = str(cfg.get("prompt") or DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
-        self.platforms = cfg.get("platforms") if isinstance(cfg.get("platforms"), dict) else {}
+        self.platforms = _normalize_platform_allowlist(cfg.get("platforms"))
         self._contexts: dict[str, GatewayContext] = {}
         self._counts: dict[str, int] = {}
 
     @classmethod
-    def from_runtime_config(cls) -> "AutoContinuePlugin":
+    def from_runtime_config(cls, plugin_config_path: str | Path | None = None) -> "AutoContinuePlugin":
+        path = Path(plugin_config_path) if plugin_config_path is not None else Path(__file__).resolve().parent / "config.yaml"
         try:
-            from hermes_cli.config import load_config
-
-            cfg = load_config() or {}
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
         except Exception:
-            logger.debug("auto-continue: could not load Hermes config", exc_info=True)
-            cfg = {}
-        plugin_cfg = cfg.get("hermes_auto_continue") or cfg.get("auto_continue") or {}
-        if not isinstance(plugin_cfg, dict):
-            plugin_cfg = {}
-        return cls(plugin_cfg)
+            logger.debug("auto-continue: could not load plugin config from %s", path, exc_info=True)
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return cls(raw)
 
     def pre_gateway_dispatch(self, *, event: Any, gateway: Any, session_store: Any, **_: Any) -> None:
         if not self.enabled:
@@ -97,6 +98,8 @@ class AutoContinuePlugin:
             return
         context = self._contexts.get(sid)
         platform_name = _platform_name(platform or (context.platform if context else ""))
+        if context is not None and platform_name and context.platform != platform_name:
+            return
         if not self._platform_enabled(platform_name):
             return
 
@@ -153,10 +156,9 @@ class AutoContinuePlugin:
     def _platform_enabled(self, platform: str) -> bool:
         if not platform:
             return False
-        cfg = self.platforms.get(platform)
-        if isinstance(cfg, dict) and "enabled" in cfg:
-            return bool(cfg.get("enabled"))
-        return True
+        if self.platforms is None:
+            return True
+        return platform in self.platforms
 
     def _active_goal_exists(self, session_id: str) -> bool:
         try:
@@ -170,6 +172,21 @@ class AutoContinuePlugin:
 def _platform_name(platform: Any) -> str:
     value = getattr(platform, "value", platform)
     return str(value or "").strip().lower()
+
+
+def _normalize_platform_allowlist(raw_platforms: Any) -> set[str] | None:
+    if raw_platforms is None:
+        return None
+    if isinstance(raw_platforms, dict):
+        allowed = {
+            _platform_name(platform)
+            for platform, platform_cfg in raw_platforms.items()
+            if not isinstance(platform_cfg, dict) or bool(platform_cfg.get("enabled", True))
+        }
+        return allowed or set()
+    if isinstance(raw_platforms, (list, tuple, set)):
+        return {_platform_name(platform) for platform in raw_platforms if _platform_name(platform)}
+    return None
 
 
 def _adapter_for(gateway: Any, platform: Any) -> Any:

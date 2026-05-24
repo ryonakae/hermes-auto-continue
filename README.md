@@ -28,28 +28,46 @@ Clone this repository under the Hermes plugin directory:
 git clone git@github.com:ryonakae/hermes-auto-continue.git ~/.hermes/plugins/hermes-auto-continue
 ```
 
-Enable it in `~/.hermes/config.yaml`:
+Enable the plugin in `~/.hermes/config.yaml`:
 
 ```yaml
 plugins:
   enabled:
     - hermes-auto-continue
-
-hermes_auto_continue:
-  enabled: true
-  max_auto_continues: 3
-  prompt: >-
-    Continue autonomously from the current state. Do not repeat completed work.
-    Stop and summarize if blocked, if approval is required, or before destructive
-    or externally visible actions.
-  platforms:
-    slack:
-      enabled: true
-    telegram:
-      enabled: true
-    discord:
-      enabled: true
 ```
+
+Configure runtime behavior in `~/.hermes/plugins/hermes-auto-continue/config.yaml`:
+
+```yaml
+enabled: true
+max_auto_continues: 3
+prompt: >-
+  Continue autonomously from the current state. Do not repeat completed work.
+  Stop and summarize if blocked, if approval is required, or before destructive
+  or externally visible actions.
+platforms:
+  - telegram
+  - discord
+  - slack
+  - whatsapp
+  - signal
+  - matrix
+  - mattermost
+  - email
+  - sms
+  - dingtalk
+  - wecom
+  - weixin
+  - feishu
+  - qqbot
+  - bluebubbles
+  - yuanbao
+  - webhook
+  - api_server
+  - homeassistant
+```
+
+`platforms` is an allowlist. Remove a platform name to disable auto-continue for that platform. If `platforms` is omitted, all gateway platforms are allowed.
 
 Restart the Hermes gateway after changing plugin code or config.
 

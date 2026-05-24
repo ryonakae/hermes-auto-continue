@@ -7,6 +7,31 @@ import pytest
 from hermes_auto_continue import AutoContinuePlugin, MAX_ITERATION_SUMMARY_REQUEST
 
 
+ALL_PLATFORM_CONFIG = {
+    "platforms": [
+        "telegram",
+        "discord",
+        "slack",
+        "whatsapp",
+        "signal",
+        "matrix",
+        "mattermost",
+        "email",
+        "sms",
+        "dingtalk",
+        "wecom",
+        "weixin",
+        "feishu",
+        "qqbot",
+        "bluebubbles",
+        "yuanbao",
+        "webhook",
+        "api_server",
+        "homeassistant",
+    ]
+}
+
+
 class FakeSessionEntry:
     def __init__(self, session_id: str = "session-1", session_key: str = "slack:chat:thread"):
         self.session_id = session_id
@@ -48,6 +73,66 @@ def max_iteration_history(summary: str = "I reached the limit; here is progress 
         {"role": "user", "content": MAX_ITERATION_SUMMARY_REQUEST},
         {"role": "assistant", "content": summary},
     ]
+
+
+def test_reads_config_from_plugin_directory_config_yaml(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "enabled: true\n"
+        "max_auto_continues: 7\n"
+        "prompt: Local config prompt.\n"
+        "platforms:\n"
+        "  - slack\n"
+        "  - telegram\n",
+        encoding="utf-8",
+    )
+
+    plugin = AutoContinuePlugin.from_runtime_config(plugin_config_path=config_path)
+
+    assert plugin.enabled is True
+    assert plugin.max_auto_continues == 7
+    assert plugin.prompt == "Local config prompt."
+    assert plugin._platform_enabled("slack") is True
+    assert plugin._platform_enabled("telegram") is True
+    assert plugin._platform_enabled("discord") is False
+
+
+def test_platforms_array_is_an_allowlist():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed.", **ALL_PLATFORM_CONFIG})
+    gateway = FakeGateway()
+    gateway.adapters["matrix"] = object()
+    gateway.adapters["sms"] = object()
+    store = FakeSessionStore()
+    matrix_event = make_event(platform="matrix")
+    sms_event = make_event(platform="sms")
+    unknown_event = make_event(platform="mastodon")
+
+    plugin.pre_gateway_dispatch(event=matrix_event, gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="matrix",
+    )
+    assert len(gateway.enqueued) == 1
+
+    plugin.pre_gateway_dispatch(event=sms_event, gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="sms",
+    )
+    assert len(gateway.enqueued) == 2
+
+    plugin.pre_gateway_dispatch(event=unknown_event, gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="mastodon",
+    )
+    assert len(gateway.enqueued) == 2
 
 
 def test_records_gateway_context_and_enqueues_continuation_after_max_iteration_summary():

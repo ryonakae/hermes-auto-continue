@@ -1,0 +1,26 @@
+enabled: true
+max_auto_continues: 3
+prompt: >-
+  Continue autonomously from the current state. Do not repeat completed work.
+  Stop and summarize if blocked, if approval is required, or before destructive
+  or externally visible actions.
+platforms:
+  - telegram
+  - discord
+  - slack
+  - whatsapp
+  - signal
+  - matrix
+  - mattermost
+  - email
+  - sms
+  - dingtalk
+  - wecom
+  - weixin
+  - feishu
+  - qqbot
+  - bluebubbles
+  - yuanbao
+  - webhook
+  - api_server
+  - homeassistant

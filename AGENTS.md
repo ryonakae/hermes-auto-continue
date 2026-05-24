@@ -42,7 +42,7 @@ PY
 - Detect max-iteration summary turns by the built-in summary request string in `conversation_history`, not by fuzzy assistant wording.
 - Skip auto-continue when built-in `/goal` is active for the session; two continuation loops should not compete.
 - Keep continuation bounded by `max_auto_continues`; do not add unbounded retry behavior.
-- Runtime config comes from `hermes_auto_continue` in `~/.hermes/config.yaml`.
+- Runtime config comes from `config.yaml` in this plugin directory. Only plugin enablement lives in `~/.hermes/config.yaml` under `plugins.enabled`.
 
 ## Workflow
 
