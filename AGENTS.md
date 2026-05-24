@@ -8,7 +8,7 @@ This repository is a standalone Hermes Agent plugin. It should live at `~/.herme
 - `__init__.py` — thin loader that exposes `register(ctx)`.
 - `hermes_auto_continue.py` — plugin implementation.
 - `tests/test_auto_continue.py` — behavior tests for gateway continuation.
-- `README.md` — user-facing install/config/runtime notes.
+- `config.example.yaml` — tracked runtime config template. Copy it to ignored `config.yaml` for local use.
 
 ## Commands
 
@@ -42,7 +42,7 @@ PY
 - Detect max-iteration summary turns by the built-in summary request string in `conversation_history`, not by fuzzy assistant wording.
 - Skip auto-continue when built-in `/goal` is active for the session; two continuation loops should not compete.
 - Keep continuation bounded by `max_auto_continues`; do not add unbounded retry behavior.
-- Runtime config comes from `config.yaml` in this plugin directory. Only plugin enablement lives in `~/.hermes/config.yaml` under `plugins.enabled`.
+- Runtime config comes from ignored `config.yaml` in this plugin directory. Keep `config.example.yaml` tracked as the template. Only plugin enablement lives in `~/.hermes/config.yaml` under `plugins.enabled`.
 
 ## Workflow
 

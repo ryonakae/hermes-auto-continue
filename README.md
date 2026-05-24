@@ -36,7 +36,14 @@ plugins:
     - hermes-auto-continue
 ```
 
-Configure runtime behavior in `~/.hermes/plugins/hermes-auto-continue/config.yaml`:
+Configure runtime behavior by copying the example config:
+
+```bash
+cp ~/.hermes/plugins/hermes-auto-continue/config.example.yaml \
+  ~/.hermes/plugins/hermes-auto-continue/config.yaml
+```
+
+Then edit `~/.hermes/plugins/hermes-auto-continue/config.yaml`:
 
 ```yaml
 enabled: true

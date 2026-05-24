@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import types
 
 import pytest
@@ -73,6 +74,19 @@ def max_iteration_history(summary: str = "I reached the limit; here is progress 
         {"role": "user", "content": MAX_ITERATION_SUMMARY_REQUEST},
         {"role": "assistant", "content": summary},
     ]
+
+
+def test_config_example_is_valid_and_matches_runtime_shape():
+    config_example = Path("config.example.yaml")
+    assert config_example.exists()
+
+    plugin = AutoContinuePlugin.from_runtime_config(plugin_config_path=config_example)
+
+    assert plugin.enabled is True
+    assert plugin.max_auto_continues == 3
+    assert plugin.prompt
+    assert plugin._platform_enabled("slack") is True
+    assert plugin._platform_enabled("telegram") is True
 
 
 def test_reads_config_from_plugin_directory_config_yaml(tmp_path):
