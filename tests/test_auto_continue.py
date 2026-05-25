@@ -5,7 +5,7 @@ import types
 
 import pytest
 
-from hermes_auto_continue import AutoContinuePlugin, MAX_ITERATION_SUMMARY_REQUEST
+from hermes_auto_continue import AutoContinuePlugin, MAX_ITERATION_SUMMARY_REQUEST, _make_message_event
 
 
 ALL_PLATFORM_CONFIG = {
@@ -171,6 +171,103 @@ def test_records_gateway_context_and_enqueues_continuation_after_max_iteration_s
     assert queued_event.source is event.source
     assert queued_event.message_id is None
     assert queued_event.channel_prompt is None
+    assert queued_event.media_urls == []
+    assert queued_event.media_types == []
+    assert queued_event.reply_to_message_id is None
+    assert queued_event.reply_to_text is None
+    assert queued_event.raw_message is None
+    assert queued_event.platform_update_id is None
+    assert queued_event.auto_skill is None
+    assert queued_event.channel_context is None
+    assert queued_event.internal is False
+    assert queued_event.timestamp is not None
+
+
+def test_make_message_event_is_compatible_with_gateway_inbound_preparation():
+    from gateway.platforms.base import MessageEvent
+
+    source = types.SimpleNamespace(platform="slack")
+
+    event = _make_message_event(text="Proceed.", source=source)
+
+    assert isinstance(event, MessageEvent)
+    assert event.text == "Proceed."
+    assert event.source is source
+    assert event.message_id is None
+    assert event.channel_prompt is None
+    assert event.media_urls == []
+    assert event.media_types == []
+    assert event.reply_to_message_id is None
+    assert event.reply_to_text is None
+    assert event.raw_message is None
+    assert event.platform_update_id is None
+    assert event.auto_skill is None
+    assert event.channel_context is None
+    assert event.internal is False
+    assert event.timestamp is not None
+
+
+def test_make_message_event_fallback_has_gateway_compatible_fields(monkeypatch):
+    real_import = __import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "gateway.platforms.base":
+            raise ImportError("forced fallback")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+    source = types.SimpleNamespace(platform="slack")
+
+    event = _make_message_event(text="Proceed.", source=source)
+
+    assert event.text == "Proceed."
+    assert event.source is source
+    assert event.media_urls == []
+    assert event.media_types == []
+    assert event.reply_to_message_id is None
+    assert event.reply_to_text is None
+    assert event.raw_message is None
+    assert event.platform_update_id is None
+    assert event.auto_skill is None
+    assert event.channel_prompt is None
+    assert event.channel_context is None
+    assert event.internal is False
+    assert event.timestamp is not None
+
+    second = _make_message_event(text="Again.", source=source)
+    assert second.media_urls == []
+    assert second.media_urls is not event.media_urls
+
+
+@pytest.mark.asyncio
+async def test_synthetic_event_survives_prepare_inbound_message_text_no_media():
+    from gateway.run import GatewayRunner
+
+    source = types.SimpleNamespace(
+        platform="slack",
+        chat_id="C123",
+        thread_id="177",
+        user_id="U123",
+        user_name="Ryo",
+        chat_type="channel",
+    )
+    event = _make_message_event(text="Proceed.", source=source)
+    fake_runner = types.SimpleNamespace(
+        config=types.SimpleNamespace(group_sessions_per_user=True, thread_sessions_per_user=False),
+        adapters={},
+        _pending_native_image_paths_by_session={},
+        _session_key_for_source=lambda _source: "slack:C123:177",
+        _consume_pending_native_image_paths=lambda _session_key: None,
+    )
+
+    message = await GatewayRunner._prepare_inbound_message_text(
+        fake_runner,
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert "Proceed." in message
 
 
 def test_enforces_per_session_auto_continue_bound():

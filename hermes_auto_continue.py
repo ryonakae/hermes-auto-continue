@@ -233,7 +233,7 @@ def _is_max_iteration_summary_turn(history: list[dict[str, Any]]) -> bool:
 
 def _make_message_event(*, text: str, source: Any) -> Any:
     try:
-        from gateway.session import MessageEvent, MessageType
+        from gateway.platforms.base import MessageEvent, MessageType
 
         return MessageEvent(
             text=text,
@@ -243,17 +243,26 @@ def _make_message_event(*, text: str, source: Any) -> Any:
             channel_prompt=None,
         )
     except Exception:
-        return type(
-            "AutoContinueMessageEvent",
-            (),
-            {
-                "text": text,
-                "message_type": "text",
-                "source": source,
-                "message_id": None,
-                "channel_prompt": None,
-            },
-        )()
+        from datetime import datetime
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            text=text,
+            message_type="text",
+            source=source,
+            raw_message=None,
+            message_id=None,
+            platform_update_id=None,
+            media_urls=[],
+            media_types=[],
+            reply_to_message_id=None,
+            reply_to_text=None,
+            auto_skill=None,
+            channel_prompt=None,
+            channel_context=None,
+            internal=False,
+            timestamp=datetime.now(),
+        )
 
 
 _PLUGIN = AutoContinuePlugin.from_runtime_config()
