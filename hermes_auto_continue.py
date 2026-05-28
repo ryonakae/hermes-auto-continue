@@ -31,6 +31,20 @@ class GatewayContext:
     platform: str
 
 
+@dataclass
+class SessionLink:
+    parent_id: str | None
+    child_end_reason: str | None
+    parent_end_reason: str | None
+
+
+@dataclass
+class ContextResolution:
+    context: GatewayContext | None
+    ancestor_session_ids: tuple[str, ...] = ()
+    blocked_reason: str | None = None
+
+
 class AutoContinuePlugin:
     def __init__(self, config: dict[str, Any] | None = None):
         cfg = config or {}
@@ -96,21 +110,28 @@ class AutoContinuePlugin:
         sid = str(session_id or "")
         if not sid:
             return
-        context = self._contexts.get(sid)
+        if not _is_max_iteration_summary_turn(conversation_history or []):
+            self._counts.pop(sid, None)
+            return
+
+        resolution = self._context_for_session(sid)
+        context = resolution.context
         platform_name = _platform_name(platform or (context.platform if context else ""))
         if context is not None and platform_name and context.platform != platform_name:
             return
         if not self._platform_enabled(platform_name):
             return
 
-        if not _is_max_iteration_summary_turn(conversation_history or []):
-            self._counts.pop(sid, None)
+        if context is None:
+            logger.info(
+                "auto-continue: no gateway context for session %s reason=%s",
+                sid,
+                resolution.blocked_reason or "missing_context",
+            )
             return
 
-        if context is None:
-            logger.debug("auto-continue: no gateway context for session %s", sid)
-            return
-        if self._active_goal_exists(sid):
+        goal_session_ids = {sid, *resolution.ancestor_session_ids}
+        if any(self._active_goal_exists(goal_sid) for goal_sid in goal_session_ids):
             logger.info("auto-continue: skipping session %s because /goal is active", sid)
             return
 
@@ -167,6 +188,96 @@ class AutoContinuePlugin:
             return GoalManager(session_id=session_id).is_active()
         except Exception:
             return False
+
+    def _context_for_session(self, session_id: str) -> ContextResolution:
+        context = self._contexts.get(session_id)
+        visited: set[str] = {session_id}
+        ancestors: list[str] = []
+        current = session_id
+
+        while True:
+            link = self._session_link(current)
+            parent = link.parent_id
+            if not parent:
+                if context is not None:
+                    self._migrate_counts(session_id, ancestors)
+                    return ContextResolution(context=context, ancestor_session_ids=tuple(ancestors))
+                return ContextResolution(context=None, blocked_reason="no_parent")
+            if parent in visited:
+                if context is not None:
+                    self._migrate_counts(session_id, ancestors)
+                    return ContextResolution(context=context, ancestor_session_ids=tuple(ancestors))
+                return ContextResolution(context=None, blocked_reason="cycle")
+            if not _is_compression_link(link):
+                if context is not None:
+                    self._migrate_counts(session_id, ancestors)
+                    return ContextResolution(context=context, ancestor_session_ids=tuple(ancestors))
+                return ContextResolution(context=None, blocked_reason="non_compression_parent")
+
+            visited.add(parent)
+            ancestors.append(parent)
+            parent_context = self._contexts.get(parent)
+            if parent_context is not None and context is None:
+                context = parent_context
+                self._contexts[session_id] = context
+                logger.info(
+                    "auto-continue: recovered gateway context for session %s from compression ancestor %s",
+                    session_id,
+                    parent,
+                )
+            current = parent
+
+    def _migrate_counts(self, session_id: str, ancestors: list[str]) -> None:
+        inherited = self._counts.get(session_id, 0)
+        for ancestor in ancestors:
+            inherited = max(inherited, self._counts.pop(ancestor, 0))
+        if inherited:
+            self._counts[session_id] = inherited
+
+    def _state_db_path(self) -> Path:
+        try:
+            from hermes_constants import get_hermes_home
+
+            return get_hermes_home() / "state.db"
+        except Exception:
+            return Path.home() / ".hermes" / "state.db"
+
+    def _session_link(self, session_id: str) -> SessionLink:
+        try:
+            import sqlite3
+
+            db_path = self._state_db_path()
+            if not db_path.exists():
+                logger.info(
+                    "auto-continue: state db not found while resolving parent for session %s",
+                    session_id,
+                )
+                return SessionLink(parent_id=None, child_end_reason=None, parent_end_reason=None)
+            with sqlite3.connect(db_path) as con:
+                row = con.execute(
+                    """
+                    select child.parent_session_id, child.end_reason, parent.end_reason
+                    from sessions child
+                    left join sessions parent on parent.id = child.parent_session_id
+                    where child.id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+            if not row:
+                return SessionLink(parent_id=None, child_end_reason=None, parent_end_reason=None)
+            parent, child_end_reason, parent_end_reason = row
+            return SessionLink(
+                parent_id=str(parent) if parent else None,
+                child_end_reason=str(child_end_reason) if child_end_reason else None,
+                parent_end_reason=str(parent_end_reason) if parent_end_reason else None,
+            )
+        except Exception:
+            logger.info("auto-continue: parent lookup failed for session %s", session_id, exc_info=True)
+            return SessionLink(parent_id=None, child_end_reason=None, parent_end_reason=None)
+
+
+def _is_compression_link(link: SessionLink) -> bool:
+    return link.child_end_reason == "compression" or link.parent_end_reason == "compression"
 
 
 def _platform_name(platform: Any) -> str:

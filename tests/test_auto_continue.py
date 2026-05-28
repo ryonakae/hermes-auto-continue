@@ -5,7 +5,7 @@ import types
 
 import pytest
 
-from hermes_auto_continue import AutoContinuePlugin, MAX_ITERATION_SUMMARY_REQUEST, _make_message_event
+from hermes_auto_continue import AutoContinuePlugin, MAX_ITERATION_SUMMARY_REQUEST, SessionLink, _make_message_event
 
 
 ALL_PLATFORM_CONFIG = {
@@ -45,6 +45,19 @@ class FakeSessionStore:
 
     def get_or_create_session(self, source):
         return self.entry
+
+
+class FakeSessionLinkLookup:
+    def __init__(self, links: dict[str, tuple[str | None, str | None, str | None]]):
+        self.links = links
+
+    def link_for(self, session_id: str):
+        parent_id, child_end_reason, parent_end_reason = self.links.get(session_id, (None, None, None))
+        return SessionLink(
+            parent_id=parent_id,
+            child_end_reason=child_end_reason,
+            parent_end_reason=parent_end_reason,
+        )
 
 
 class FakeGateway:
@@ -268,6 +281,239 @@ async def test_synthetic_event_survives_prepare_inbound_message_text_no_media():
     )
 
     assert "Proceed." in message
+
+
+def test_recovers_gateway_context_from_compression_parent_session():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore(FakeSessionEntry(session_id="old-session", session_key="slack:chat:thread"))
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin._session_link = FakeSessionLinkLookup({"new-session": ("old-session", None, "compression")}).link_for
+
+    plugin.post_llm_call(
+        session_id="new-session",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert len(gateway.enqueued) == 1
+    session_key, queued_event, adapter = gateway.enqueued[0]
+    assert session_key == "slack:chat:thread"
+    assert queued_event.text == "Proceed."
+    assert adapter is gateway.adapters["slack"]
+    assert plugin._counts["new-session"] == 1
+    assert "new-session" in plugin._contexts
+
+
+def test_does_not_recover_gateway_context_from_non_compression_parent_session():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore(FakeSessionEntry(session_id="old-session", session_key="slack:chat:thread"))
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin._session_link = FakeSessionLinkLookup({"new-session": ("old-session", "branch", None)}).link_for
+
+    plugin.post_llm_call(
+        session_id="new-session",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert gateway.enqueued == []
+    assert "new-session" not in plugin._contexts
+
+
+def test_compression_parent_recovery_preserves_auto_continue_bound():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 1, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore(FakeSessionEntry(session_id="old-session", session_key="slack:chat:thread"))
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin._counts["old-session"] = 1
+    plugin._session_link = FakeSessionLinkLookup({"new-session": ("old-session", None, "compression")}).link_for
+
+    plugin.post_llm_call(
+        session_id="new-session",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert gateway.enqueued == []
+    assert plugin._counts["new-session"] == 1
+    assert "old-session" not in plugin._counts
+
+
+def test_skips_when_compression_parent_has_active_goal(monkeypatch):
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore(FakeSessionEntry(session_id="old-session", session_key="slack:chat:thread"))
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin._session_link = FakeSessionLinkLookup({"new-session": ("old-session", None, "compression")}).link_for
+    monkeypatch.setattr(plugin, "_active_goal_exists", lambda session_id: session_id == "old-session")
+
+    plugin.post_llm_call(
+        session_id="new-session",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert gateway.enqueued == []
+
+
+def test_skips_when_intermediate_compression_ancestor_has_active_goal(monkeypatch):
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore(FakeSessionEntry(session_id="old-session", session_key="slack:chat:thread"))
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin._session_link = FakeSessionLinkLookup(
+        {
+            "new-session": ("mid-session", None, "compression"),
+            "mid-session": ("old-session", None, "compression"),
+        }
+    ).link_for
+    monkeypatch.setattr(plugin, "_active_goal_exists", lambda session_id: session_id == "mid-session")
+
+    plugin.post_llm_call(
+        session_id="new-session",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert gateway.enqueued == []
+
+
+def test_recovers_gateway_context_when_child_row_marks_compression(tmp_path, monkeypatch):
+    import sqlite3
+
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as con:
+        con.execute("create table sessions (id text primary key, parent_session_id text, end_reason text)")
+        con.execute(
+            "insert into sessions (id, parent_session_id, end_reason) values (?, ?, ?)",
+            ("parent-session", None, None),
+        )
+        con.execute(
+            "insert into sessions (id, parent_session_id, end_reason) values (?, ?, ?)",
+            ("child-session", "parent-session", "compression"),
+        )
+
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore(FakeSessionEntry(session_id="parent-session", session_key="slack:chat:thread"))
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    monkeypatch.setattr(plugin, "_state_db_path", lambda: db_path)
+
+    plugin.post_llm_call(
+        session_id="child-session",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert len(gateway.enqueued) == 1
+    assert gateway.enqueued[0][0] == "slack:chat:thread"
+
+
+def test_session_link_reads_parent_and_parent_end_reason_from_state_db(tmp_path, monkeypatch):
+    import sqlite3
+
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as con:
+        con.execute("create table sessions (id text primary key, parent_session_id text, end_reason text)")
+        con.execute(
+            "insert into sessions (id, parent_session_id, end_reason) values (?, ?, ?)",
+            ("parent-session", None, "compression"),
+        )
+        con.execute(
+            "insert into sessions (id, parent_session_id, end_reason) values (?, ?, ?)",
+            ("child-session", "parent-session", None),
+        )
+
+    plugin = AutoContinuePlugin({"enabled": True})
+    monkeypatch.setattr(plugin, "_state_db_path", lambda: db_path)
+
+    link = plugin._session_link("child-session")
+
+    assert link.parent_id == "parent-session"
+    assert link.parent_end_reason == "compression"
+
+
+def test_cached_child_context_still_checks_compression_parent_goal(monkeypatch):
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    old_store = FakeSessionStore(FakeSessionEntry(session_id="old-session", session_key="slack:chat:thread"))
+    new_store = FakeSessionStore(FakeSessionEntry(session_id="new-session", session_key="slack:chat:thread"))
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=old_store)
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=new_store)
+    plugin._session_link = FakeSessionLinkLookup({"new-session": ("old-session", None, "compression")}).link_for
+    monkeypatch.setattr(plugin, "_active_goal_exists", lambda session_id: session_id == "old-session")
+
+    plugin.post_llm_call(
+        session_id="new-session",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert gateway.enqueued == []
+
+
+def test_cached_child_context_inherits_compression_parent_count_bound():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 1, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    old_store = FakeSessionStore(FakeSessionEntry(session_id="old-session", session_key="slack:chat:thread"))
+    new_store = FakeSessionStore(FakeSessionEntry(session_id="new-session", session_key="slack:chat:thread"))
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=old_store)
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=new_store)
+    plugin._counts["old-session"] = 1
+    plugin._session_link = FakeSessionLinkLookup({"new-session": ("old-session", None, "compression")}).link_for
+
+    plugin.post_llm_call(
+        session_id="new-session",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert gateway.enqueued == []
+    assert plugin._counts["new-session"] == 1
+    assert "old-session" not in plugin._counts
+
+
+def test_recovers_gateway_context_through_long_compression_chain():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    gateway = FakeGateway()
+    store = FakeSessionStore(FakeSessionEntry(session_id="session-0", session_key="slack:chat:thread"))
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    links = {
+        f"session-{i}": (f"session-{i - 1}", None, "compression")
+        for i in range(1, 11)
+    }
+    plugin._session_link = FakeSessionLinkLookup(links).link_for
+
+    plugin.post_llm_call(
+        session_id="session-10",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert len(gateway.enqueued) == 1
 
 
 def test_enforces_per_session_auto_continue_bound():
