@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 import types
 
@@ -65,6 +66,9 @@ class FakeAdapter:
     def __init__(self, *, fail_send: bool = False):
         self.fail_send = fail_send
         self.sent = []
+        self.deliveries = []
+        self._post_delivery_callbacks = {}
+        self._active_sessions = {}
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         if self.fail_send:
@@ -77,7 +81,44 @@ class FakeAdapter:
                 "metadata": metadata,
             }
         )
-        return types.SimpleNamespace(success=True, message_id="notice-1")
+        self.deliveries.append(content)
+        return types.SimpleNamespace(success=True, message_id=f"msg-{len(self.sent)}")
+
+    def register_post_delivery_callback(self, session_key, callback, *, generation=None):
+        self._post_delivery_callbacks[session_key] = (
+            (int(generation), callback) if generation is not None else callback
+        )
+
+    def pop_post_delivery_callback(self, session_key, *, generation=None):
+        entry = self._post_delivery_callbacks.get(session_key)
+        if entry is None:
+            return None
+        if isinstance(entry, tuple) and len(entry) == 2:
+            entry_generation, callback = entry
+            if generation is not None and int(entry_generation) != int(generation):
+                return None
+            self._post_delivery_callbacks.pop(session_key, None)
+            return callback if callable(callback) else None
+        if generation is not None:
+            return None
+        self._post_delivery_callbacks.pop(session_key, None)
+        return entry if callable(entry) else None
+
+
+class FakeAdapterWithoutCallbacks:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return types.SimpleNamespace(success=True, message_id=f"msg-{len(self.sent)}")
 
 
 class FakeGateway:
@@ -108,6 +149,18 @@ def run_scheduled_notice_immediately(monkeypatch):
         return types.SimpleNamespace(result=lambda timeout=None: None)
 
     monkeypatch.setattr("asyncio.run_coroutine_threadsafe", run_coroutine_threadsafe)
+
+
+def run_post_delivery_callback(adapter, session_key="slack:chat:thread", *, generation=None):
+    callback = adapter.pop_post_delivery_callback(session_key, generation=generation)
+    assert callable(callback)
+    result = callback()
+    if inspect.isawaitable(result):
+        asyncio.run(result)
+
+
+def set_active_generation(adapter, session_key="slack:chat:thread", generation=7):
+    adapter._active_sessions[session_key] = types.SimpleNamespace(_hermes_run_generation=generation)
 
 
 def make_event(text: str = "hello", platform: str = "slack"):
@@ -264,7 +317,168 @@ def test_sends_visible_notice_after_successful_continuation_enqueue(monkeypatch)
     ]
 
 
-def test_visible_notice_count_advances_for_repeated_continuations(monkeypatch):
+def test_registers_visible_notice_for_post_delivery_after_successful_continuation_enqueue():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed carefully."})
+    adapter = FakeAdapter()
+    set_active_generation(adapter, generation=7)
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert len(gateway.enqueued) == 1
+    assert adapter.sent == []
+    assert "slack:chat:thread" in adapter._post_delivery_callbacks
+    assert adapter.pop_post_delivery_callback("slack:chat:thread", generation=6) is None
+    assert "slack:chat:thread" in adapter._post_delivery_callbacks
+
+    run_post_delivery_callback(adapter, generation=7)
+
+    assert adapter.sent == [
+        {
+            "chat_id": "C123",
+            "content": ":robot_face: Injected auto-continue prompt (1/3):\nProceed carefully.",
+            "reply_to": None,
+            "metadata": {"thread_id": "177"},
+        }
+    ]
+
+
+def test_registers_visible_notice_with_gateway_generation_fallback():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    gateway = FakeGateway(adapter=adapter)
+    gateway._session_run_generation = {"slack:chat:thread": 9}
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert adapter.pop_post_delivery_callback("slack:chat:thread", generation=8) is None
+    run_post_delivery_callback(adapter, generation=9)
+    assert adapter.sent[0]["content"] == ":robot_face: Injected auto-continue prompt (1/3):\nProceed."
+
+
+def test_chains_same_generation_existing_post_delivery_callback_before_notice():
+    calls = []
+
+    async def existing():
+        calls.append("existing")
+
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    set_active_generation(adapter, generation=7)
+    adapter._post_delivery_callbacks["slack:chat:thread"] = (7, existing)
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+    run_post_delivery_callback(adapter, generation=7)
+
+    assert calls == ["existing"]
+    assert adapter.sent[0]["content"] == ":robot_face: Injected auto-continue prompt (1/3):\nProceed."
+
+
+def test_chains_existing_unversioned_post_delivery_callback_before_notice():
+    calls = []
+
+    async def existing():
+        calls.append("existing")
+
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    set_active_generation(adapter, generation=7)
+    adapter._post_delivery_callbacks["slack:chat:thread"] = existing
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+    run_post_delivery_callback(adapter, generation=7)
+
+    assert calls == ["existing"]
+    assert adapter.sent[0]["content"] == ":robot_face: Injected auto-continue prompt (1/3):\nProceed."
+
+
+def test_preserves_existing_newer_generation_callback_without_stale_notice():
+    calls = []
+
+    def existing():
+        calls.append("existing")
+
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    set_active_generation(adapter, generation=7)
+    adapter._post_delivery_callbacks["slack:chat:thread"] = (8, existing)
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    entry = adapter._post_delivery_callbacks["slack:chat:thread"]
+    assert entry == (8, existing)
+    assert adapter.sent == []
+    run_post_delivery_callback(adapter, generation=8)
+    assert calls == ["existing"]
+    assert adapter.sent == []
+
+
+def test_replaces_existing_older_generation_callback_without_running_it():
+    calls = []
+
+    def existing():
+        calls.append("existing")
+
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    set_active_generation(adapter, generation=7)
+    adapter._post_delivery_callbacks["slack:chat:thread"] = (6, existing)
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+    run_post_delivery_callback(adapter, generation=7)
+
+    assert calls == []
+    assert adapter.sent[0]["content"] == ":robot_face: Injected auto-continue prompt (1/3):\nProceed."
+
+
+def test_no_generation_callback_path_falls_back_to_immediate_notice(monkeypatch):
     run_scheduled_notice_immediately(monkeypatch)
     plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
     adapter = FakeAdapter()
@@ -272,17 +486,91 @@ def test_visible_notice_count_advances_for_repeated_continuations(monkeypatch):
     store = FakeSessionStore()
 
     plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
-    for _ in range(2):
-        plugin.post_llm_call(
-            session_id="session-1",
-            conversation_history=max_iteration_history(),
-            assistant_response="summary",
-            platform="slack",
-        )
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert adapter._post_delivery_callbacks == {}
+    assert adapter.sent[0]["content"] == ":robot_face: Injected auto-continue prompt (1/3):\nProceed."
+
+
+def test_visible_notice_follows_split_summary_chunks_after_post_delivery_callback():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    set_active_generation(adapter, generation=7)
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert adapter.sent == []
+    adapter.deliveries.append("summary chunk A")
+    adapter.deliveries.append("summary chunk B")
+    run_post_delivery_callback(adapter, generation=7)
+
+    assert adapter.deliveries == [
+        "summary chunk A",
+        "summary chunk B",
+        ":robot_face: Injected auto-continue prompt (1/3):\nProceed.",
+    ]
+
+
+def test_adapter_without_post_delivery_callbacks_uses_immediate_notice_fallback(monkeypatch):
+    run_scheduled_notice_immediately(monkeypatch)
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapterWithoutCallbacks()
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert adapter.sent[0]["content"] == ":robot_face: Injected auto-continue prompt (1/3):\nProceed."
+
+
+def test_visible_notice_count_advances_for_repeated_continuations():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    set_active_generation(adapter, generation=7)
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+    assert adapter.sent == []
+    run_post_delivery_callback(adapter, generation=7)
+    assert adapter.sent[-1]["content"].startswith(":robot_face: Injected auto-continue prompt (1/3):\n")
+
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+    assert len(adapter.sent) == 1
+    run_post_delivery_callback(adapter, generation=7)
 
     assert len(gateway.enqueued) == 2
-    assert adapter.sent[0]["content"].startswith(":robot_face: Injected auto-continue prompt (1/3):\n")
-    assert adapter.sent[1]["content"].startswith(":robot_face: Injected auto-continue prompt (2/3):\n")
+    assert adapter.sent[-1]["content"].startswith(":robot_face: Injected auto-continue prompt (2/3):\n")
 
 
 def test_visible_notice_uses_unicode_robot_for_non_slack_platforms(monkeypatch):
@@ -304,10 +592,10 @@ def test_visible_notice_uses_unicode_robot_for_non_slack_platforms(monkeypatch):
     assert adapter.sent[0]["content"] == "🤖 Injected auto-continue prompt (1/3):\nProceed."
 
 
-def test_visible_notice_send_failure_does_not_block_continuation(monkeypatch):
-    run_scheduled_notice_immediately(monkeypatch)
+def test_visible_notice_send_failure_does_not_block_continuation():
     plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
     adapter = FakeAdapter(fail_send=True)
+    set_active_generation(adapter, generation=7)
     gateway = FakeGateway(adapter=adapter)
     store = FakeSessionStore()
 
@@ -320,6 +608,7 @@ def test_visible_notice_send_failure_does_not_block_continuation(monkeypatch):
     )
 
     assert len(gateway.enqueued) == 1
+    run_post_delivery_callback(adapter, generation=7)
     assert plugin._counts["session-1"] == 1
     assert adapter.sent == []
 
@@ -341,6 +630,7 @@ def test_does_not_send_visible_notice_when_enqueue_cannot_happen(monkeypatch):
 
     assert plugin._counts == {}
     assert adapter.sent == []
+    assert adapter._post_delivery_callbacks == {}
 
 
 def test_make_message_event_is_compatible_with_gateway_inbound_preparation():

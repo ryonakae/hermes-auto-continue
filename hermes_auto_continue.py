@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import asyncio
+import inspect
 import logging
 
 import yaml
@@ -154,7 +155,7 @@ class AutoContinuePlugin:
         enqueue(context.session_key, event, context.adapter)
         current_count = used + 1
         self._counts[sid] = current_count
-        self._schedule_visible_notice(context, self._format_notice(current_count, context.platform))
+        self._register_visible_notice(context, self._format_notice(current_count, context.platform))
         logger.info(
             "auto-continue: queued continuation for session %s (%d/%d)",
             sid,
@@ -168,31 +169,115 @@ class AutoContinuePlugin:
             f"Injected auto-continue prompt ({current_count}/{self.max_auto_continues}):\n{self.prompt}"
         )
 
+    def _adapter_generation(self, context: GatewayContext) -> int | None:
+        try:
+            active = getattr(context.adapter, "_active_sessions", {}).get(context.session_key)
+            generation = getattr(active, "_hermes_run_generation", None)
+            if generation is not None:
+                return int(generation)
+        except Exception:
+            pass
+        try:
+            generations = getattr(context.gateway, "_session_run_generation", {})
+            generation = generations.get(context.session_key)
+            return int(generation) if generation is not None else None
+        except Exception:
+            return None
+
+    async def _send_visible_notice(self, context: GatewayContext, notice: str) -> None:
+        metadata = None
+        metadata_for_source = getattr(context.gateway, "_thread_metadata_for_source", None)
+        if callable(metadata_for_source):
+            try:
+                metadata = metadata_for_source(context.source)
+            except Exception:
+                logger.debug("auto-continue: could not build notice metadata", exc_info=True)
+        try:
+            await context.adapter.send(context.source.chat_id, notice, metadata=metadata)
+        except Exception:
+            logger.warning("auto-continue: visible notice send failed", exc_info=True)
+
     def _schedule_visible_notice(self, context: GatewayContext, notice: str) -> None:
         loop = getattr(context.gateway, "_gateway_loop", None)
         if loop is None:
             logger.info("auto-continue: skipping visible notice because gateway loop is unavailable")
             return
 
-        async def _send_notice() -> None:
-            metadata = None
-            metadata_for_source = getattr(context.gateway, "_thread_metadata_for_source", None)
-            if callable(metadata_for_source):
-                try:
-                    metadata = metadata_for_source(context.source)
-                except Exception:
-                    logger.debug("auto-continue: could not build notice metadata", exc_info=True)
-            try:
-                await context.adapter.send(context.source.chat_id, notice, metadata=metadata)
-            except Exception:
-                logger.warning("auto-continue: visible notice send failed", exc_info=True)
-
-        coro = _send_notice()
+        coro = self._send_visible_notice(context, notice)
         try:
             asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception:
             coro.close()
             logger.warning("auto-continue: could not schedule visible notice", exc_info=True)
+
+    def _unwrap_post_delivery_entry(self, entry: Any) -> tuple[int | None, Any | None]:
+        if isinstance(entry, tuple) and len(entry) == 2:
+            generation, callback = entry
+            try:
+                return int(generation), callback
+            except Exception:
+                return None, callback
+        return None, entry if callable(entry) else None
+
+    def _register_visible_notice(self, context: GatewayContext, notice: str) -> None:
+        callbacks = getattr(context.adapter, "_post_delivery_callbacks", None)
+        register = getattr(context.adapter, "register_post_delivery_callback", None)
+        generation = self._adapter_generation(context)
+
+        if generation is None and (callbacks is not None or callable(register)):
+            logger.info("auto-continue: no run generation for post-delivery notice; sending visible notice immediately")
+            self._schedule_visible_notice(context, notice)
+            return
+
+        existing_generation = None
+        existing_callback = None
+        if isinstance(callbacks, dict):
+            existing_generation, existing_callback = self._unwrap_post_delivery_entry(callbacks.get(context.session_key))
+
+        effective_generation = generation if generation is not None else existing_generation
+
+        async def _after_delivery() -> None:
+            if callable(existing_callback):
+                try:
+                    result = existing_callback()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.debug("auto-continue: existing post-delivery callback failed", exc_info=True)
+            await self._send_visible_notice(context, notice)
+
+        try:
+            if isinstance(callbacks, dict) and callable(existing_callback):
+                if existing_generation is not None and effective_generation is not None:
+                    if effective_generation < existing_generation:
+                        logger.info("auto-continue: skipping stale visible notice callback registration")
+                        return
+                    if effective_generation == existing_generation:
+                        callbacks[context.session_key] = (effective_generation, _after_delivery)
+                        return
+                    existing_callback = None
+                    callbacks[context.session_key] = (effective_generation, _after_delivery)
+                    return
+                callbacks[context.session_key] = (
+                    (effective_generation, _after_delivery)
+                    if effective_generation is not None
+                    else _after_delivery
+                )
+                return
+            if callable(register):
+                register(context.session_key, _after_delivery, generation=effective_generation)
+                return
+        except TypeError:
+            try:
+                if callable(register):
+                    register(context.session_key, _after_delivery)
+                    return
+            except Exception:
+                pass
+        except Exception:
+            logger.warning("auto-continue: could not register visible notice callback", exc_info=True)
+
+        self._schedule_visible_notice(context, notice)
 
     def command(self, args: str = "") -> str:
         arg = (args or "").strip().lower()

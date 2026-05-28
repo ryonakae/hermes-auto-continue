@@ -82,7 +82,7 @@ Restart the Hermes gateway after changing plugin code or config.
 
 - Detects max-iteration summary turns by looking for Hermes' built-in summary request in `conversation_history`.
 - Queues the configured prompt into the same gateway session using private gateway FIFO API (`gateway._enqueue_fifo`).
-- Posts a visible side notice in the same gateway conversation after a successful injection. Slack uses its emoji shortcode so the message renders as a Slack emoji; other platforms use Unicode:
+- Posts a visible side notice in the same gateway conversation after a successful injection. When the platform adapter supports post-delivery callbacks, the notice is sent after the assistant summary delivery completes, so split long summaries stay together before the notice. Slack uses its emoji shortcode so the message renders as a Slack emoji; other platforms use Unicode:
 
   ```text
   :robot_face: Injected auto-continue prompt (1/3):
