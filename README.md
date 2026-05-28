@@ -82,6 +82,14 @@ Restart the Hermes gateway after changing plugin code or config.
 
 - Detects max-iteration summary turns by looking for Hermes' built-in summary request in `conversation_history`.
 - Queues the configured prompt into the same gateway session using private gateway FIFO API (`gateway._enqueue_fifo`).
+- Posts a visible side notice in the same gateway conversation after a successful injection:
+
+  ```text
+  🤖 Injected auto-continue prompt (1/3):
+  <configured prompt>
+  ```
+
+  The notice is not queued as user input; the actual continuation is still delivered internally through the gateway FIFO.
 - Bounds continuation per session with `max_auto_continues`.
 - Resets the per-session count after a normal non-max-iteration turn.
 - Skips sessions with an active built-in `/goal`, to avoid competing continuation loops.

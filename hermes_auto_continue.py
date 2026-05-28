@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import asyncio
 import logging
 
 import yaml
@@ -151,13 +152,44 @@ class AutoContinuePlugin:
             logger.warning("auto-continue: gateway has no _enqueue_fifo; cannot continue")
             return
         enqueue(context.session_key, event, context.adapter)
-        self._counts[sid] = used + 1
+        current_count = used + 1
+        self._counts[sid] = current_count
+        self._schedule_visible_notice(context, self._format_notice(current_count))
         logger.info(
             "auto-continue: queued continuation for session %s (%d/%d)",
             sid,
-            used + 1,
+            current_count,
             self.max_auto_continues,
         )
+
+    def _format_notice(self, current_count: int) -> str:
+        return f"🤖 Injected auto-continue prompt ({current_count}/{self.max_auto_continues}):\n{self.prompt}"
+
+    def _schedule_visible_notice(self, context: GatewayContext, notice: str) -> None:
+        loop = getattr(context.gateway, "_gateway_loop", None)
+        if loop is None:
+            logger.info("auto-continue: skipping visible notice because gateway loop is unavailable")
+            return
+
+        async def _send_notice() -> None:
+            metadata = None
+            metadata_for_source = getattr(context.gateway, "_thread_metadata_for_source", None)
+            if callable(metadata_for_source):
+                try:
+                    metadata = metadata_for_source(context.source)
+                except Exception:
+                    logger.debug("auto-continue: could not build notice metadata", exc_info=True)
+            try:
+                await context.adapter.send(context.source.chat_id, notice, metadata=metadata)
+            except Exception:
+                logger.warning("auto-continue: visible notice send failed", exc_info=True)
+
+        coro = _send_notice()
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:
+            coro.close()
+            logger.warning("auto-continue: could not schedule visible notice", exc_info=True)
 
     def command(self, args: str = "") -> str:
         arg = (args or "").strip().lower()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import types
 
@@ -60,13 +61,53 @@ class FakeSessionLinkLookup:
         )
 
 
+class FakeAdapter:
+    def __init__(self, *, fail_send: bool = False):
+        self.fail_send = fail_send
+        self.sent = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        if self.fail_send:
+            raise RuntimeError("send failed")
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return types.SimpleNamespace(success=True, message_id="notice-1")
+
+
 class FakeGateway:
-    def __init__(self):
-        self.adapters = {"slack": object()}
+    def __init__(self, *, adapter: FakeAdapter | None = None):
+        self.adapters: dict[str, object] = {"slack": adapter or FakeAdapter()}
         self.enqueued = []
+        self._gateway_loop = object()
 
     def _enqueue_fifo(self, session_key, event, adapter):
         self.enqueued.append((session_key, event, adapter))
+
+    def _thread_metadata_for_source(self, source):
+        return {"thread_id": source.thread_id}
+
+
+class FakeGatewayWithoutEnqueue:
+    def __init__(self, *, adapter: FakeAdapter | None = None):
+        self.adapters: dict[str, object] = {"slack": adapter or FakeAdapter()}
+        self._gateway_loop = object()
+
+    def _thread_metadata_for_source(self, source):
+        return {"thread_id": source.thread_id}
+
+
+def run_scheduled_notice_immediately(monkeypatch):
+    def run_coroutine_threadsafe(coro, loop):
+        asyncio.run(coro)
+        return types.SimpleNamespace(result=lambda timeout=None: None)
+
+    monkeypatch.setattr("asyncio.run_coroutine_threadsafe", run_coroutine_threadsafe)
 
 
 def make_event(text: str = "hello", platform: str = "slack"):
@@ -194,6 +235,93 @@ def test_records_gateway_context_and_enqueues_continuation_after_max_iteration_s
     assert queued_event.channel_context is None
     assert queued_event.internal is False
     assert queued_event.timestamp is not None
+
+
+def test_sends_visible_notice_after_successful_continuation_enqueue(monkeypatch):
+    run_scheduled_notice_immediately(monkeypatch)
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed carefully."})
+    adapter = FakeAdapter()
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+    event = make_event()
+
+    plugin.pre_gateway_dispatch(event=event, gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert len(gateway.enqueued) == 1
+    assert adapter.sent == [
+        {
+            "chat_id": "C123",
+            "content": "🤖 Injected auto-continue prompt (1/3):\nProceed carefully.",
+            "reply_to": None,
+            "metadata": {"thread_id": "177"},
+        }
+    ]
+
+
+def test_visible_notice_count_advances_for_repeated_continuations(monkeypatch):
+    run_scheduled_notice_immediately(monkeypatch)
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    for _ in range(2):
+        plugin.post_llm_call(
+            session_id="session-1",
+            conversation_history=max_iteration_history(),
+            assistant_response="summary",
+            platform="slack",
+        )
+
+    assert len(gateway.enqueued) == 2
+    assert adapter.sent[0]["content"].startswith("🤖 Injected auto-continue prompt (1/3):\n")
+    assert adapter.sent[1]["content"].startswith("🤖 Injected auto-continue prompt (2/3):\n")
+
+
+def test_visible_notice_send_failure_does_not_block_continuation(monkeypatch):
+    run_scheduled_notice_immediately(monkeypatch)
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    adapter = FakeAdapter(fail_send=True)
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert len(gateway.enqueued) == 1
+    assert plugin._counts["session-1"] == 1
+    assert adapter.sent == []
+
+
+def test_does_not_send_visible_notice_when_enqueue_cannot_happen(monkeypatch):
+    run_scheduled_notice_immediately(monkeypatch)
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    gateway = FakeGatewayWithoutEnqueue(adapter=adapter)
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+
+    assert plugin._counts == {}
+    assert adapter.sent == []
 
 
 def test_make_message_event_is_compatible_with_gateway_inbound_preparation():
