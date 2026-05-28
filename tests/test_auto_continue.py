@@ -257,7 +257,7 @@ def test_sends_visible_notice_after_successful_continuation_enqueue(monkeypatch)
     assert adapter.sent == [
         {
             "chat_id": "C123",
-            "content": "🤖 Injected auto-continue prompt (1/3):\nProceed carefully.",
+            "content": ":robot_face: Injected auto-continue prompt (1/3):\nProceed carefully.",
             "reply_to": None,
             "metadata": {"thread_id": "177"},
         }
@@ -281,8 +281,27 @@ def test_visible_notice_count_advances_for_repeated_continuations(monkeypatch):
         )
 
     assert len(gateway.enqueued) == 2
-    assert adapter.sent[0]["content"].startswith("🤖 Injected auto-continue prompt (1/3):\n")
-    assert adapter.sent[1]["content"].startswith("🤖 Injected auto-continue prompt (2/3):\n")
+    assert adapter.sent[0]["content"].startswith(":robot_face: Injected auto-continue prompt (1/3):\n")
+    assert adapter.sent[1]["content"].startswith(":robot_face: Injected auto-continue prompt (2/3):\n")
+
+
+def test_visible_notice_uses_unicode_robot_for_non_slack_platforms(monkeypatch):
+    run_scheduled_notice_immediately(monkeypatch)
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    gateway = FakeGateway()
+    gateway.adapters["telegram"] = adapter
+    store = FakeSessionStore()
+
+    plugin.pre_gateway_dispatch(event=make_event(platform="telegram"), gateway=gateway, session_store=store)
+    plugin.post_llm_call(
+        session_id="session-1",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="telegram",
+    )
+
+    assert adapter.sent[0]["content"] == "🤖 Injected auto-continue prompt (1/3):\nProceed."
 
 
 def test_visible_notice_send_failure_does_not_block_continuation(monkeypatch):

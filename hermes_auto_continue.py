@@ -154,7 +154,7 @@ class AutoContinuePlugin:
         enqueue(context.session_key, event, context.adapter)
         current_count = used + 1
         self._counts[sid] = current_count
-        self._schedule_visible_notice(context, self._format_notice(current_count))
+        self._schedule_visible_notice(context, self._format_notice(current_count, context.platform))
         logger.info(
             "auto-continue: queued continuation for session %s (%d/%d)",
             sid,
@@ -162,8 +162,11 @@ class AutoContinuePlugin:
             self.max_auto_continues,
         )
 
-    def _format_notice(self, current_count: int) -> str:
-        return f"🤖 Injected auto-continue prompt ({current_count}/{self.max_auto_continues}):\n{self.prompt}"
+    def _format_notice(self, current_count: int, platform: str) -> str:
+        return (
+            f"{_notice_emoji_for_platform(platform)} "
+            f"Injected auto-continue prompt ({current_count}/{self.max_auto_continues}):\n{self.prompt}"
+        )
 
     def _schedule_visible_notice(self, context: GatewayContext, notice: str) -> None:
         loop = getattr(context.gateway, "_gateway_loop", None)
@@ -315,6 +318,12 @@ def _is_compression_link(link: SessionLink) -> bool:
 def _platform_name(platform: Any) -> str:
     value = getattr(platform, "value", platform)
     return str(value or "").strip().lower()
+
+
+def _notice_emoji_for_platform(platform: Any) -> str:
+    if _platform_name(platform) == "slack":
+        return ":robot_face:"
+    return "🤖"
 
 
 def _normalize_platform_allowlist(raw_platforms: Any) -> set[str] | None:
