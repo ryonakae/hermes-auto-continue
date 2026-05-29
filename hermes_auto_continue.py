@@ -137,7 +137,7 @@ class AutoContinuePlugin:
             logger.info("auto-continue: skipping session %s because /goal is active", sid)
             return
 
-        used = self._counts.get(sid, 0)
+        used = self._continuation_count(sid, resolution.ancestor_session_ids, context)
         if used >= self.max_auto_continues:
             logger.info(
                 "auto-continue: session %s reached bound %d/%d",
@@ -353,6 +353,18 @@ class AutoContinuePlugin:
             inherited = max(inherited, self._counts.pop(ancestor, 0))
         if inherited:
             self._counts[session_id] = inherited
+
+    def _continuation_count(self, session_id: str, ancestors: tuple[str, ...], context: GatewayContext) -> int:
+        inherited = self._counts.get(session_id, 0)
+        related_session_ids = set(ancestors)
+        for known_session_id, known_context in list(self._contexts.items()):
+            if known_session_id != session_id and known_context.session_key == context.session_key:
+                related_session_ids.add(known_session_id)
+        for related_session_id in related_session_ids:
+            inherited = max(inherited, self._counts.pop(related_session_id, 0))
+        if inherited:
+            self._counts[session_id] = inherited
+        return inherited
 
     def _state_db_path(self) -> Path:
         try:

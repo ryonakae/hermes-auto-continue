@@ -42,7 +42,7 @@ PY
 - Visible auto-continue notices are registered as post-delivery callbacks when adapters support a safe generation-aware callback path, so long assistant summaries finish before the notice appears. The normal path awaits the notice send before the queued follow-up turn starts. Do not queue the notice as a `MessageEvent`.
 - Detect max-iteration summary turns by the built-in summary request string in `conversation_history`, not by fuzzy assistant wording.
 - Skip auto-continue when built-in `/goal` is active for the session; two continuation loops should not compete.
-- Keep continuation bounded by `max_auto_continues`; do not add unbounded retry behavior.
+- Keep continuation bounded by `max_auto_continues`; do not add unbounded retry behavior. Counts must carry across compression descendants and sibling sessions that share the same gateway `session_key`, so Slack thread notices do not regress from `(2/3)` back to `(1/3)` after a session split.
 - Runtime config comes from ignored `config.yaml` in this plugin directory. Keep `config.example.yaml` tracked as the template. Only plugin enablement lives in `~/.hermes/config.yaml` under `plugins.enabled`.
 
 ## Workflow

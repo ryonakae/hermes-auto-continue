@@ -787,6 +787,32 @@ def test_compression_parent_recovery_preserves_auto_continue_bound():
     assert "old-session" not in plugin._counts
 
 
+def test_compression_sibling_recovery_preserves_auto_continue_count_for_same_thread():
+    plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 3, "prompt": "Proceed."})
+    adapter = FakeAdapter()
+    set_active_generation(adapter, generation=7)
+    gateway = FakeGateway(adapter=adapter)
+    store = FakeSessionStore(FakeSessionEntry(session_id="root-session", session_key="slack:chat:thread"))
+
+    plugin.pre_gateway_dispatch(event=make_event(), gateway=gateway, session_store=store)
+    plugin._contexts["first-child"] = plugin._contexts["root-session"]
+    plugin._counts["first-child"] = 2
+    plugin._session_link = FakeSessionLinkLookup({"second-child": ("root-session", None, "compression")}).link_for
+
+    plugin.post_llm_call(
+        session_id="second-child",
+        conversation_history=max_iteration_history(),
+        assistant_response="summary",
+        platform="slack",
+    )
+    run_post_delivery_callback(adapter, generation=7)
+
+    assert len(gateway.enqueued) == 1
+    assert plugin._counts["second-child"] == 3
+    assert "first-child" not in plugin._counts
+    assert adapter.sent[0]["content"] == ":robot_face: Injected auto-continue prompt (3/3):\nProceed."
+
+
 def test_skips_when_compression_parent_has_active_goal(monkeypatch):
     plugin = AutoContinuePlugin({"enabled": True, "max_auto_continues": 2, "prompt": "Proceed."})
     gateway = FakeGateway()
