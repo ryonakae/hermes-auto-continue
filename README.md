@@ -1,6 +1,6 @@
 # hermes-auto-continue
 
-Keep Hermes Agent gateway conversations moving after a max-iteration summary by injecting one bounded follow-up turn into the same thread.
+A Hermes Agent plugin that keeps gateway conversations moving after a max-iteration summary by injecting one bounded follow-up turn into the same thread.
 
 <!-- README-I18N:START -->
 
