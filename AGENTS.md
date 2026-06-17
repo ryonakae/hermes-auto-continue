@@ -1,25 +1,18 @@
 # AGENTS.md
 
-This repository is a standalone Hermes Agent plugin. It should live at `~/.hermes/plugins/hermes-auto-continue`.
-
-## Start here
-
-- `plugin.yaml` — Hermes plugin manifest.
-- `__init__.py` — thin loader that exposes `register(ctx)`.
-- `hermes_auto_continue.py` — plugin implementation.
-- `tests/test_auto_continue.py` — behavior tests for gateway continuation.
-- `config.example.yaml` — tracked runtime config template. Copy it to ignored `config.yaml` for local use.
+Standalone Hermes Agent plugin for gateway-only auto-continue after max-iteration summaries. Work from this repository root; installed runtime copies usually live at `~/.hermes/plugins/hermes-auto-continue`.
 
 ## Commands
 
-Run from this repository root:
-
 ```bash
-python -m pytest tests/test_auto_continue.py -q
+python - <<'PY'
+import pytest
+raise SystemExit(pytest.main(['-p', 'no:rtk', 'tests/test_auto_continue.py', '-q']))
+PY
 python -m py_compile __init__.py hermes_auto_continue.py tests/test_auto_continue.py
 ```
 
-Optional discovery smoke from the Hermes checkout:
+Optional plugin discovery smoke from the Hermes checkout:
 
 ```bash
 cd ~/.hermes/hermes-agent
@@ -35,19 +28,30 @@ print('hooks=', sorted(getattr(loaded, 'hooks_registered', []) or []))
 PY
 ```
 
-## Implementation notes
+If the smoke test reports `enabled=False` with `error='not enabled in config'`, enable `hermes-auto-continue` under `plugins.enabled` and restart the gateway.
 
-- Scope is gateway-only. Do not claim CLI or ACP support unless their queue/session objects are explicitly wired in later.
-- The plugin intentionally uses private-ish gateway internals: `gateway._enqueue_fifo`, gateway `MessageEvent`, and adapter `_pending_messages` semantics. Keep that dependency documented.
-- Visible auto-continue notices are registered as post-delivery callbacks when adapters support a safe generation-aware callback path, so long assistant summaries finish before the notice appears. The normal path awaits the notice send before the queued follow-up turn starts. Do not queue the notice as a `MessageEvent`.
+## Important files
+
+- `plugin.yaml`: plugin manifest, hook list, command list, and release version.
+- `__init__.py`: loader that exposes `register(ctx)`.
+- `hermes_auto_continue.py`: plugin implementation.
+- `tests/test_auto_continue.py`: behavior tests for gateway continuation, notices, bounds, and compression session recovery.
+- `config.example.yaml`: tracked runtime config template. Copy it to ignored `config.yaml` for local runtime use.
+- `README.md` and `README.ja.md`: public docs. Keep the English README as source of truth, then update the Japanese sibling with the same structure.
+
+## Implementation constraints
+
+- Scope is gateway-only. Do not claim CLI or ACP support unless their session/queue objects are explicitly wired later.
+- Keep auto-continue bounded by `max_auto_continues`; do not add unbounded retry behavior.
 - Detect max-iteration summary turns by the built-in summary request string in `conversation_history`, not by fuzzy assistant wording.
-- Skip auto-continue when built-in `/goal` is active for the session; two continuation loops should not compete.
-- Keep continuation bounded by `max_auto_continues`; do not add unbounded retry behavior. Counts must carry across compression descendants and sibling sessions that share the same gateway `session_key`, so Slack thread notices do not regress from `(2/3)` back to `(1/3)` after a session split.
-- Runtime config comes from ignored `config.yaml` in this plugin directory. Keep `config.example.yaml` tracked as the template. Only plugin enablement lives in `~/.hermes/config.yaml` under `plugins.enabled`.
+- Skip sessions with an active built-in `/goal`; two continuation loops should not compete.
+- Count state must survive compression descendants and same-thread sibling sessions so notices do not regress from `(2/3)` to `(1/3)` after a session split.
+- Visible auto-continue notices should use post-delivery callbacks when adapter support exists. Do not queue the notice as a `MessageEvent`.
+- Runtime config belongs in ignored `config.yaml` in this plugin directory. Only plugin enablement belongs in `~/.hermes/config.yaml` under `plugins.enabled`.
 
 ## Workflow
 
-- Use TDD for behavior changes: add/update a focused test, verify RED, implement GREEN, then run the commands above.
+- Use TDD for behavior changes: add or update a focused test, verify it fails for the intended reason, implement, then run the commands above.
 - Do not edit Hermes core for this plugin unless the user explicitly approves a separate core change.
 - After changing plugin code/config in a live setup, tell the user a gateway restart is required.
-- Runtime files such as caches or state should be ignored; do not commit `__pycache__`, `.pytest_cache`, or local runtime artifacts.
+- Do not commit runtime artifacts: `config.yaml`, `__pycache__`, `.pytest_cache`, or local state files.
